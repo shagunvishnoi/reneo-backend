@@ -1,5 +1,5 @@
 import { Router, Response } from 'express';
-import { supabaseAdmin, createUserClient } from '../config/supabase';
+import { supabaseAdmin } from '../config/supabase';
 import { requireAuth, requireRole, AuthenticatedRequest } from '../middleware/auth';
 
 const router = Router();
@@ -9,19 +9,14 @@ interface OrderItemInput {
   quantity: number;
 }
 
-// ==========================================
-// POST /orders — create (CUSTOMER only)
-// ==========================================
 router.post('/', requireAuth, requireRole('CUSTOMER'), async (req: AuthenticatedRequest, res: Response) => {
-  const { items } = req.body as { items?: OrderItemInput[] };
+  const { items, idempotency_key } = req.body as { items?: OrderItemInput[]; idempotency_key?: string };
 
-  // --- Reject if client tries to send a price anywhere ---
   const rawBody = JSON.stringify(req.body);
   if (rawBody.includes('"price"') || rawBody.includes('"unit_price"') || rawBody.includes('"price_minor_units"')) {
     return res.status(400).json({ error: { code: 400, message: 'Price fields are not accepted from the client' } });
   }
 
-  // --- Basic validation ---
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: { code: 400, message: 'items array is required and cannot be empty' } });
   }
@@ -37,17 +32,42 @@ router.post('/', requireAuth, requireRole('CUSTOMER'), async (req: Authenticated
 
   const customerId = req.user!.id;
 
-  // --- Call the atomic, concurrency-safe database function ---
-  // We use supabaseAdmin here deliberately: the function needs to update
-  // inventory rows the customer doesn't own permission over directly,
-  // and the function itself is what enforces correctness (not the client's role).
+  if (idempotency_key) {
+    const { data: existingOrder } = await supabaseAdmin
+      .from('orders')
+      .select('id, total_minor_units, status')
+      .eq('idempotency_key', idempotency_key)
+      .eq('customer_id', customerId)
+      .maybeSingle();
+
+    if (existingOrder) {
+      return res.status(200).json({
+        data: { order_id: existingOrder.id, total_minor_units: existingOrder.total_minor_units },
+        note: 'Duplicate request detected — returning original order.',
+      });
+    }
+  }
+
   const { data, error } = await supabaseAdmin.rpc('place_order', {
     p_customer_id: customerId,
     p_items: items,
+    p_idempotency_key: idempotency_key || null,
   });
 
   if (error) {
     const message = error.message || '';
+
+    if (message.includes('duplicate key value violates unique constraint') && message.includes('idempotency_key')) {
+      const { data: existingOrder } = await supabaseAdmin
+        .from('orders')
+        .select('id, total_minor_units')
+        .eq('idempotency_key', idempotency_key)
+        .single();
+      return res.status(200).json({
+        data: { order_id: existingOrder?.id, total_minor_units: existingOrder?.total_minor_units },
+        note: 'Duplicate request detected — returning original order.',
+      });
+    }
 
     if (message.includes('OUT_OF_STOCK')) {
       return res.status(409).json({ error: { code: 409, message: 'Insufficient stock for one or more items', detail: message } });
